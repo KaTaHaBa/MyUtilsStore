@@ -151,6 +151,10 @@ class TaxonomyManager:
             self.base_labels = data.get('labels', {})
             self.base_categories = data.get('categories', {})
 
+    def _save_base_json(self):
+        with open(self.base_cache_file, 'w', encoding='utf-8') as f:
+            json.dump({'labels': self.base_labels, 'categories': self.base_categories}, f, ensure_ascii=False)
+            
     def build_company_specific_caches(self, xbrl_zip_paths, target_companies, rebuild=False):
         print(f"[System] 企業別拡張タクソノミの準備 (Rebuild={rebuild})...")
         new_cnt, skip_cnt = 0, 0

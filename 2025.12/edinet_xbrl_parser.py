@@ -75,6 +75,7 @@ def execute_process(
     print(f"\n[Output] CSV出力先: {save_dir}")
 
     count_files = 0
+    # 企業名が正規化されているため、表記ゆれがあっても正しくグルーピングされます
     for (company, code), group_df in df.groupby(['企業名', '証券コード']):
         # 整形（ソート）
         cat_order = {'BS': 0, 'PL': 1, 'CF': 2, 'SS': 3, 'Notes': 4, 'Others': 5}
@@ -84,13 +85,11 @@ def execute_process(
             by=['会計年度', 'sort_key', '項目名(日本語)']
         ).drop(columns=['sort_key'])
         
-        # 列順序の統一 (数値と文字のカラムを並べる)
-        desired_cols = [
+        # 列順序の統一
+        cols = [c for c in [
             '企業名', '証券コード', '会計年度', 'カテゴリ', '項目名(日本語)', 
             '値(数値)', '値(文字)', '単位', '単体連結区分', '詳細文脈', '元ファイル', '項目名(英語)'
-        ]
-        # 実際に存在するカラムのみを選択
-        cols = [c for c in desired_cols if c in out_df.columns]
+        ] if c in out_df.columns]
         out_df = out_df[cols]
 
         # ファイル名生成
@@ -141,53 +140,72 @@ class TaxonomyManager:
             else:
                 print("【警告】ラベル定義が取得できませんでした。パスを確認してください。")
         self.is_base_loaded = True
-        
-    def _load_base_json(self):
-        with open(self.base_cache_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            self.base_labels = data.get('labels', {})
-            self.base_categories = data.get('categories', {})
 
-    def _save_base_json(self):
-        with open(self.base_cache_file, 'w', encoding='utf-8') as f:
-            json.dump({'labels': self.base_labels, 'categories': self.base_categories}, f, ensure_ascii=False)
-            
     def build_company_specific_caches(self, xbrl_zip_paths, target_companies, rebuild=False):
         print(f"[System] 企業別拡張タクソノミの準備 (Rebuild={rebuild})...")
-        new_cnt, skip_cnt = 0, 0
+        
+        # 1. 処理対象のファイルを企業ごとにグループ化
+        company_zips = {} # {code: [zip_path, ...]}
+        company_names = {} # {code: name}
+        
         for zp in xbrl_zip_paths:
             try:
                 base_name = os.path.basename(zp).split('.')[0]
                 with zipfile.ZipFile(zp, 'r') as z:
                     xfiles = [f for f in z.namelist() if f.endswith('.xbrl') and 'PublicDoc' in f]
                     if not xfiles: continue
+                    
                     with z.open(xfiles[0]) as f:
                         soup = BeautifulSoup(f, 'lxml-xml')
                         fl = soup.find(re.compile(r'.*FilerNameInJapanese'))
                         cd = soup.find(re.compile(r'.*SecurityCode'))
-                        ftxt = fl.text.strip() if fl else ""
+                        
+                        # ★修正: 企業名の正規化（スペース除去）
+                        ftxt = fl.text.strip().replace(' ', '').replace('　', '') if fl else "Unknown"
                         ctxt = cd.text.strip() if cd else ""
                         
-                        if not any(k.strip() in f"{ftxt} {ctxt}" for p in target_companies for k in p.split('|')):
-                            continue
-                        
-                        s_code = ctxt if ctxt else base_name
-                        c_path = os.path.join(self.ext_cache_dir, f"map_{s_code}.json")
-                        
-                        if not rebuild and os.path.exists(c_path):
-                            skip_cnt += 1
-                            continue
-                        
-                        ext_labels = {}
+                        # ターゲット判定
+                        search_key = f"{ftxt} {ctxt}"
+                        if any(k.strip() in search_key for p in target_companies for k in p.split('|')):
+                            code = ctxt if ctxt else base_name
+                            if code not in company_zips:
+                                company_zips[code] = []
+                                company_names[code] = ftxt
+                            company_zips[code].append(zp)
+            except Exception: continue
+
+        # 2. 企業ごとに「ロード -> マージ -> 保存」を実行
+        count_updated = 0
+        
+        for code, zips in company_zips.items():
+            cache_path = os.path.join(self.ext_cache_dir, f"map_{code}.json")
+            
+            merged_labels = {}
+            if not rebuild and os.path.exists(cache_path):
+                try:
+                    with open(cache_path, 'r', encoding='utf-8') as f:
+                        merged_labels = json.load(f)
+                except: pass
+            
+            initial_count = len(merged_labels)
+            
+            for zp in zips:
+                try:
+                    with zipfile.ZipFile(zp, 'r') as z:
                         lfiles = [n for n in z.namelist() if '_lab' in n and n.endswith('.xml')]
                         for lf in lfiles:
-                            with z.open(lf) as obj: self._parse_label_stream_with_arc(obj, ext_labels)
-                        
-                        with open(c_path, 'w', encoding='utf-8') as f:
-                            json.dump(ext_labels, f, ensure_ascii=False)
-                        new_cnt += 1
-            except: continue
-        print(f" -> 新規作成: {new_cnt}, 既存利用: {skip_cnt}")
+                            with z.open(lf) as obj:
+                                self._parse_label_stream_with_arc(obj, merged_labels)
+                except: pass
+            
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump(merged_labels, f, ensure_ascii=False)
+            
+            if len(merged_labels) > initial_count:
+                print(f"  -> {company_names[code]} ({code}): {len(zips)}ファイルを統合, 定義数 {initial_count} => {len(merged_labels)}")
+            count_updated += 1
+
+        print(f" -> 完了: {count_updated} 社の辞書を整備しました。")
 
     def get_combined_map(self, company_code):
         merged = self.base_labels.copy()
@@ -233,7 +251,6 @@ class TaxonomyManager:
                 frm, to = a.get('xlink:from') or a.get('from'), a.get('xlink:to') or a.get('to')
                 if frm in t_locs and to in t_lbls:
                     self._reg_label(ldict, t_locs[frm], t_lbls[to])
-            # Fallback
             for lid, txt in t_lbls.items():
                 if lid.startswith('label_'): self._reg_label(ldict, lid.replace('label_', ''), txt)
         except: pass
@@ -283,6 +300,16 @@ class TaxonomyManager:
             if pl_re.search(t) and c!='PL': self.base_categories[t]='PL'
             elif bs_re.search(t) and c!='BS': self.base_categories[t]='BS'
 
+    def _load_base_json(self):
+        with open(self.base_cache_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            self.base_labels = data.get('labels', {})
+            self.base_categories = data.get('categories', {})
+
+    def _save_base_json(self):
+        with open(self.base_cache_file, 'w', encoding='utf-8') as f:
+            json.dump({'labels': self.base_labels, 'categories': self.base_categories}, f, ensure_ascii=False)
+
 class XbrlExtractor:
     def __init__(self, tm):
         self.tm = tm
@@ -309,7 +336,9 @@ class XbrlExtractor:
             
             fl = soup.find(re.compile(r'.*FilerNameInJapanese'))
             cd = soup.find(re.compile(r'.*SecurityCode'))
-            ftxt = fl.text.strip() if fl else "Unknown"
+            
+            # ★修正: 企業名の正規化（スペース除去）
+            ftxt = fl.text.strip().replace(' ', '').replace('　', '') if fl else "Unknown"
             ctxt = cd.text.strip() if cd else ""
             
             if not any(k.strip() in f"{ftxt} {ctxt}" for p in pats for k in p.split('|')): return []
@@ -345,27 +374,14 @@ class XbrlExtractor:
                 info = ctxs[cref]
                 if years and info['fy'] not in years: continue
                 
-                # --- ★修正ポイント: 値の取得ロジック（数値か文字かで分岐） ---
                 val_str = t.text.strip()
-                if not val_str: continue # 空ならスキップ
+                if not val_str: continue
 
-                is_numeric = re.match(r'^-?\d+(\.\d+)?$', val_str)
-                
-                val_num = None
-                val_text = None
-
-                if is_numeric:
-                    val_num = float(val_str)
+                val_num, val_text = None, None
+                if re.match(r'^-?\d+(\.\d+)?$', val_str): val_num = float(val_str)
                 else:
-                    # 自然言語（TextBlock等）の処理
-                    # HTMLタグが含まれる、またはTextBlockタグの場合はタグを除去してテキスト化
-                    if "TextBlock" in t.name or "<" in val_str:
-                        # タグを除去して純粋なテキストのみ取得
-                        val_text = BeautifulSoup(val_str, "lxml").get_text(" ", strip=True)
-                    else:
-                        val_text = val_str
-                
-                # -----------------------------------------------------------
+                    if "TextBlock" in t.name or "<" in val_str: val_text = BeautifulSoup(val_str, "lxml").get_text(" ", strip=True)
+                    else: val_text = val_str
                 
                 tname = t.name
                 lbl = "-"
@@ -378,12 +394,9 @@ class XbrlExtractor:
                 
                 res.append({
                     '企業名': ftxt, '証券コード': ctxt, '会計年度': info['fy'], 'カテゴリ': cat,
-                    '項目名(日本語)': lbl, 
-                    '値(数値)': val_num,   # 数値カラム
-                    '値(文字)': val_text,  # 文字カラム
-                    '単位': t.get('unitRef'),
-                    '単体連結区分': info['type'], '詳細文脈': info['det'], '元ファイル': fname,
-                    '項目名(英語)': f"{t.prefix}:{t.name}" if t.prefix else t.name
+                    '項目名(日本語)': lbl, '値(数値)': val_num, '値(文字)': val_text,
+                    '単位': t.get('unitRef'), '単体連結区分': info['type'], '詳細文脈': info['det'], 
+                    '元ファイル': fname, '項目名(英語)': f"{t.prefix}:{t.name}" if t.prefix else t.name
                 })
         return res
 

@@ -14,7 +14,7 @@ import pandas as pd
 DEFAULT_BASE_CACHE_NAME = "taxonomy_base_cache.json"
 
 # =============================================================================
-# 統合実行関数 (Notebookから呼ぶのはこれだけ)
+# 統合実行関数
 # =============================================================================
 def execute_process(
     xbrl_zip_dir,
@@ -27,9 +27,6 @@ def execute_process(
 ):
     """
     EDINET解析の一連のフローを一括実行するラッパー関数
-    
-    Returns:
-        pd.DataFrame: 抽出された全データのDataFrame
     """
     print("="*60)
     print("EDINET XBRL PARSER - AUTOMATED PROCESS START")
@@ -37,7 +34,7 @@ def execute_process(
 
     # 1. 初期化と汎用タクソノミのロード
     tm = TaxonomyManager(taxonomy_dir, map_cache_dir)
-    tm.load_base_taxonomy() # キャッシュがあれば高速ロード、なければ構築
+    tm.load_base_taxonomy()
 
     # 2. 対象Zipファイルの収集
     if not os.path.exists(xbrl_zip_dir):
@@ -71,13 +68,12 @@ def execute_process(
 
     df = pd.DataFrame(result_data)
     
-    # 出力フォルダ作成 (タイムスタンプ付き)
+    # 出力フォルダ作成
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     save_dir = os.path.join(output_base_dir, f"result-{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
     print(f"\n[Output] CSV出力先: {save_dir}")
 
-    # 企業ごとにCSV分割保存
     count_files = 0
     for (company, code), group_df in df.groupby(['企業名', '証券コード']):
         # 整形（ソート）
@@ -88,12 +84,13 @@ def execute_process(
             by=['会計年度', 'sort_key', '項目名(日本語)']
         ).drop(columns=['sort_key'])
         
-        # 列順序の統一
-        cols = [c for c in [
+        # 列順序の統一 (数値と文字のカラムを並べる)
+        desired_cols = [
             '企業名', '証券コード', '会計年度', 'カテゴリ', '項目名(日本語)', 
-            '値', '単位', '単体連結区分', '詳細文脈', '元ファイル', '項目名(英語)'
-        ] if c in out_df.columns]
-        
+            '値(数値)', '値(文字)', '単位', '単体連結区分', '詳細文脈', '元ファイル', '項目名(英語)'
+        ]
+        # 実際に存在するカラムのみを選択
+        cols = [c for c in desired_cols if c in out_df.columns]
         out_df = out_df[cols]
 
         # ファイル名生成
@@ -113,7 +110,7 @@ def execute_process(
 
 
 # =============================================================================
-# 以下、コアクラス定義 (TaxonomyManager, XbrlExtractor)
+# コアクラス定義 (TaxonomyManager, XbrlExtractor)
 # =============================================================================
 
 class TaxonomyManager:
@@ -199,7 +196,6 @@ class TaxonomyManager:
             with open(ep, 'r', encoding='utf-8') as f: merged.update(json.load(f))
         return merged, self.base_categories
 
-    # --- Internal Logic ---
     def _find_taxonomy_zip(self, d):
         z = glob.glob(os.path.join(d, "*.zip"))
         return z[0] if z else None
@@ -349,8 +345,27 @@ class XbrlExtractor:
                 info = ctxs[cref]
                 if years and info['fy'] not in years: continue
                 
-                val = t.text.strip()
-                if not re.match(r'^-?\d+(\.\d+)?$', val): continue
+                # --- ★修正ポイント: 値の取得ロジック（数値か文字かで分岐） ---
+                val_str = t.text.strip()
+                if not val_str: continue # 空ならスキップ
+
+                is_numeric = re.match(r'^-?\d+(\.\d+)?$', val_str)
+                
+                val_num = None
+                val_text = None
+
+                if is_numeric:
+                    val_num = float(val_str)
+                else:
+                    # 自然言語（TextBlock等）の処理
+                    # HTMLタグが含まれる、またはTextBlockタグの場合はタグを除去してテキスト化
+                    if "TextBlock" in t.name or "<" in val_str:
+                        # タグを除去して純粋なテキストのみ取得
+                        val_text = BeautifulSoup(val_str, "lxml").get_text(" ", strip=True)
+                    else:
+                        val_text = val_str
+                
+                # -----------------------------------------------------------
                 
                 tname = t.name
                 lbl = "-"
@@ -363,7 +378,10 @@ class XbrlExtractor:
                 
                 res.append({
                     '企業名': ftxt, '証券コード': ctxt, '会計年度': info['fy'], 'カテゴリ': cat,
-                    '項目名(日本語)': lbl, '値': float(val), '単位': t.get('unitRef'),
+                    '項目名(日本語)': lbl, 
+                    '値(数値)': val_num,   # 数値カラム
+                    '値(文字)': val_text,  # 文字カラム
+                    '単位': t.get('unitRef'),
                     '単体連結区分': info['type'], '詳細文脈': info['det'], '元ファイル': fname,
                     '項目名(英語)': f"{t.prefix}:{t.name}" if t.prefix else t.name
                 })

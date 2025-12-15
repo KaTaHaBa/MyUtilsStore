@@ -4,6 +4,7 @@ import zipfile
 import json
 import re
 import time
+import traceback
 from datetime import datetime
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -23,13 +24,13 @@ def execute_process(
     target_companies,
     target_years,
     rebuild_map=False,
-    output_base_dir="out"
+    save_dir="out"
 ):
     """
     EDINET解析の一連のフローを一括実行するラッパー関数
     """
     print("="*60)
-    print("EDINET XBRL PARSER - AUTOMATED PROCESS START")
+    print("EDINET XBRL PARSER - AUTOMATED PROCESS START (BUGFIXED)")
     print("="*60)
 
     # 1. 初期化と汎用タクソノミのロード
@@ -69,13 +70,10 @@ def execute_process(
     df = pd.DataFrame(result_data)
     
     # 出力フォルダ作成
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    save_dir = os.path.join(output_base_dir, f"result-{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
     print(f"\n[Output] CSV出力先: {save_dir}")
 
     count_files = 0
-    # 企業名が正規化されているため、表記ゆれがあっても正しくグルーピングされます
     for (company, code), group_df in df.groupby(['企業名', '証券コード']):
         # 整形（ソート）
         cat_order = {'BS': 0, 'PL': 1, 'CF': 2, 'SS': 3, 'Notes': 4, 'Others': 5}
@@ -85,14 +83,13 @@ def execute_process(
             by=['会計年度', 'sort_key', '項目名(日本語)']
         ).drop(columns=['sort_key'])
         
-        # 列順序の統一
         cols = [c for c in [
             '企業名', '証券コード', '会計年度', 'カテゴリ', '項目名(日本語)', 
-            '値(数値)', '値(文字)', '単位', '単体連結区分', '詳細文脈', '元ファイル', '項目名(英語)'
+            '値(数値)', '値(文字)', '単位', '単体連結区分', '詳細文脈', '元ファイル', 
+            'タグ(要素名)', 'タグ(Prefix)', '全ラベル', 'ContextID'
         ] if c in out_df.columns]
         out_df = out_df[cols]
 
-        # ファイル名生成
         safe_name = str(company).replace('/', '・').replace('\\', '￥')
         fy_start = target_years[0] if target_years else "ALL"
         fy_end = target_years[-1] if target_years else "ALL"
@@ -117,9 +114,14 @@ class TaxonomyManager:
         self.taxonomy_dir = taxonomy_dir
         self.ext_cache_dir = map_cache_dir
         self.base_cache_file = base_cache_path if base_cache_path else DEFAULT_BASE_CACHE_NAME
-        self.base_labels = {}
-        self.base_categories = {}
+        
+        self.base_labels = {}     # {TagName: BestLabel}
+        self.base_aliases = {}    # {TagName: [Label1, Label2...]}
+        self.base_categories = {} # {TagName: Category}
+        self.tag_roles = {}       # {TagName: role_uri}
+        
         self.is_base_loaded = False
+        
         if not os.path.exists(self.ext_cache_dir): os.makedirs(self.ext_cache_dir)
 
     def load_base_taxonomy(self):
@@ -132,21 +134,21 @@ class TaxonomyManager:
             t_start = time.time()
             zip_path = self._find_taxonomy_zip(self.taxonomy_dir)
             if not zip_path: raise FileNotFoundError(f"Taxonomy Zip not found in {self.taxonomy_dir}")
+            
             self._build_base_from_zip(zip_path)
             self._apply_category_overrides()
+            
             if len(self.base_labels) > 0:
                 self._save_base_json()
                 print(f" -> 解析完了 ({time.time()-t_start:.1f}s). キャッシュ保存済み。")
             else:
-                print("【警告】ラベル定義が取得できませんでした。パスを確認してください。")
+                print("【警告】ラベル定義が1つも取得できませんでした。解析ロジックを確認してください。")
         self.is_base_loaded = True
 
     def build_company_specific_caches(self, xbrl_zip_paths, target_companies, rebuild=False):
         print(f"[System] 企業別拡張タクソノミの準備 (Rebuild={rebuild})...")
-        
-        # 1. 処理対象のファイルを企業ごとにグループ化
-        company_zips = {} # {code: [zip_path, ...]}
-        company_names = {} # {code: name}
+        company_zips = {} 
+        company_names = {}
         
         for zp in xbrl_zip_paths:
             try:
@@ -154,17 +156,13 @@ class TaxonomyManager:
                 with zipfile.ZipFile(zp, 'r') as z:
                     xfiles = [f for f in z.namelist() if f.endswith('.xbrl') and 'PublicDoc' in f]
                     if not xfiles: continue
-                    
                     with z.open(xfiles[0]) as f:
                         soup = BeautifulSoup(f, 'lxml-xml')
                         fl = soup.find(re.compile(r'.*FilerNameInJapanese'))
                         cd = soup.find(re.compile(r'.*SecurityCode'))
-                        
-                        # ★修正: 企業名の正規化（スペース除去）
                         ftxt = fl.text.strip().replace(' ', '').replace('　', '') if fl else "Unknown"
                         ctxt = cd.text.strip() if cd else ""
                         
-                        # ターゲット判定
                         search_key = f"{ftxt} {ctxt}"
                         if any(k.strip() in search_key for p in target_companies for k in p.split('|')):
                             code = ctxt if ctxt else base_name
@@ -174,20 +172,20 @@ class TaxonomyManager:
                             company_zips[code].append(zp)
             except Exception: continue
 
-        # 2. 企業ごとに「ロード -> マージ -> 保存」を実行
         count_updated = 0
-        
         for code, zips in company_zips.items():
             cache_path = os.path.join(self.ext_cache_dir, f"map_{code}.json")
             
             merged_labels = {}
+            merged_aliases = {}
+            
             if not rebuild and os.path.exists(cache_path):
                 try:
                     with open(cache_path, 'r', encoding='utf-8') as f:
-                        merged_labels = json.load(f)
+                        data = json.load(f)
+                        merged_labels = data.get('labels', {})
+                        merged_aliases = data.get('aliases', {})
                 except: pass
-            
-            initial_count = len(merged_labels)
             
             for zp in zips:
                 try:
@@ -195,24 +193,37 @@ class TaxonomyManager:
                         lfiles = [n for n in z.namelist() if '_lab' in n and n.endswith('.xml')]
                         for lf in lfiles:
                             with z.open(lf) as obj:
-                                self._parse_label_stream_with_arc(obj, merged_labels)
-                except: pass
+                                self._parse_label_stream_with_arc(obj, merged_labels, merged_aliases, use_priority=False)
+                except Exception as e:
+                    print(f"Error parsing company zip {zp}: {e}")
             
             with open(cache_path, 'w', encoding='utf-8') as f:
-                json.dump(merged_labels, f, ensure_ascii=False)
+                json.dump({'labels': merged_labels, 'aliases': merged_aliases}, f, ensure_ascii=False)
             
-            if len(merged_labels) > initial_count:
-                print(f"  -> {company_names[code]} ({code}): {len(zips)}ファイルを統合, 定義数 {initial_count} => {len(merged_labels)}")
             count_updated += 1
-
         print(f" -> 完了: {count_updated} 社の辞書を整備しました。")
 
     def get_combined_map(self, company_code):
-        merged = self.base_labels.copy()
-        ep = os.path.join(self.ext_cache_dir, f"map_{company_code}.json")
-        if os.path.exists(ep):
-            with open(ep, 'r', encoding='utf-8') as f: merged.update(json.load(f))
-        return merged, self.base_categories
+        merged_lbl = self.base_labels.copy()
+        merged_als = self.base_aliases.copy()
+        
+        ext_path = os.path.join(self.ext_cache_dir, f"map_{company_code}.json")
+        if os.path.exists(ext_path):
+            with open(ext_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if 'labels' in data and 'aliases' in data:
+                    merged_lbl.update(data['labels'])
+                    for k, v in data['aliases'].items():
+                        if k in merged_als:
+                            existing = set(merged_als[k])
+                            for new_lbl in v:
+                                if new_lbl not in existing: merged_als[k].append(new_lbl)
+                        else:
+                            merged_als[k] = v
+                else:
+                    merged_lbl.update(data)
+                    
+        return merged_lbl, merged_als, self.base_categories
 
     def _find_taxonomy_zip(self, d):
         z = glob.glob(os.path.join(d, "*.zip"))
@@ -224,7 +235,8 @@ class TaxonomyManager:
             print(f"  -> ラベル定義ファイル: {len(lfiles)} 個")
             for i, f in enumerate(lfiles):
                 if i%100==0: print(f"    Parsing labels {i}/{len(lfiles)}...", end='\r')
-                with z.open(f) as obj: self._parse_label_stream_with_arc(obj, self.base_labels)
+                with z.open(f) as obj: 
+                    self._parse_label_stream_with_arc(obj, self.base_labels, self.base_aliases, use_priority=True)
             
             pfiles = [f for f in z.namelist() if 'taxonomy/' in f and f.endswith('_pre.xml')]
             print(f"\n  -> 構造定義ファイル: {len(pfiles)} 個")
@@ -233,38 +245,77 @@ class TaxonomyManager:
                 with z.open(f) as obj: self._parse_pre_stream(obj, self.base_categories)
             print("")
 
-    def _parse_label_stream_with_arc(self, fobj, ldict):
+    def _parse_label_stream_with_arc(self, fobj, ldict, adict, use_priority=False):
         try:
             soup = BeautifulSoup(fobj, 'lxml-xml')
-            t_lbls, t_locs = {}, {}
-            for t in soup.find_all(re.compile(r'.*label$')):
-                lng = t.get('xml:lang') or t.get('lang')
-                if lng and lng.startswith('ja'):
-                    lid = t.get('xlink:label') or t.get('label')
-                    if lid and t.text: t_lbls[lid] = t.text.strip()
-            for t in soup.find_all(re.compile(r'.*loc$')):
-                href = t.get('xlink:href') or t.get('href')
-                if href and '#' in href:
-                    lid = t.get('xlink:label') or t.get('label')
-                    if lid: t_locs[lid] = href.split('#')[1]
-            for a in soup.find_all(re.compile(r'.*labelArc$')):
-                frm, to = a.get('xlink:from') or a.get('from'), a.get('xlink:to') or a.get('to')
-                if frm in t_locs and to in t_lbls:
-                    self._reg_label(ldict, t_locs[frm], t_lbls[to])
-            for lid, txt in t_lbls.items():
-                if lid.startswith('label_'): self._reg_label(ldict, lid.replace('label_', ''), txt)
-        except: pass
+            
+            temp_labels = {}
+            for tag in soup.find_all(re.compile(r'.*label$')):
+                lng = tag.get('xml:lang') or tag.get('lang')
+                if not lng or not lng.startswith('ja'): continue
+                
+                lid = tag.get('xlink:label') or tag.get('label')
+                role = tag.get('xlink:role') or ""
+                
+                if lid and tag.text: 
+                    temp_labels[lid] = {'text': tag.text.strip(), 'role': role}
 
-    def _reg_label(self, ldict, raw, txt):
-        ldict[raw] = txt
+            temp_locs = {}
+            for tag in soup.find_all(re.compile(r'.*loc$')):
+                href = tag.get('xlink:href') or tag.get('href')
+                if not href or '#' not in href: continue
+                raw = href.split('#')[1]
+                lid = tag.get('xlink:label') or tag.get('label')
+                if lid: temp_locs[lid] = raw
+
+            for arc in soup.find_all(re.compile(r'.*labelArc$')):
+                # ★修正: 変数名を 'a' から 'arc' に修正
+                frm = arc.get('xlink:from') or arc.get('from')
+                to = arc.get('xlink:to') or arc.get('to')
+                if frm in temp_locs and to in temp_labels:
+                    raw_tag = temp_locs[frm]
+                    label_info = temp_labels[to]
+                    self._reg_label(ldict, adict, raw_tag, label_info['text'], label_info['role'], use_priority)
+            
+            # Fallback
+            for lid, info in temp_labels.items():
+                if lid.startswith('label_'): 
+                    self._reg_label(ldict, adict, lid.replace('label_', ''), info['text'], info['role'], use_priority)
+                    
+        except Exception:
+            # エラー発生時はトレースバックを表示して、サイレントクラッシュを防ぐ
+            traceback.print_exc()
+
+    def _reg_label(self, ldict, adict, raw, txt, role, use_priority):
+        STANDARD_ROLE = "http://www.xbrl.org/2003/role/label"
+        update_main = True
+        
+        if use_priority:
+            current_role = self.tag_roles.get(raw)
+            if current_role == STANDARD_ROLE and role != STANDARD_ROLE:
+                update_main = False
+        
+        if update_main:
+            ldict[raw] = txt
+            if use_priority: self.tag_roles[raw] = role
+        
+        if raw not in adict: adict[raw] = []
+        if txt not in adict[raw]: adict[raw].append(txt)
+
         if '_' in raw:
             simple = raw.split('_')[-1]
-            if len(simple)>2 and not simple.isdigit() and simple not in ldict: ldict[simple] = txt
+            if len(simple)>2 and not simple.isdigit():
+                if simple not in ldict or update_main: ldict[simple] = txt
+                if simple not in adict: adict[simple] = []
+                if txt not in adict[simple]: adict[simple].append(txt)
+
             for p in ['jppfs_cor_', 'jpcrp_cor_', 'jpcrp', 'jpsps_cor_', 'jpigp_cor_']:
                 if raw.startswith(p):
                     cl = raw.replace(p, '')
                     if '_' in cl: cl = cl.split('_')[-1]
-                    ldict[cl] = txt
+                    if cl not in ldict or update_main: ldict[cl] = txt
+                    if cl not in adict: adict[cl] = []
+                    if txt not in adict[cl]: adict[cl].append(txt)
 
     def _parse_pre_stream(self, fobj, cdict):
         try:
@@ -275,7 +326,8 @@ class TaxonomyManager:
                 for loc in pl.find_all(re.compile(r'.*loc$')):
                     href = loc.get('xlink:href')
                     if href and '#' in href: self._upd_cat(cdict, href.split('#')[1], cat)
-        except: pass
+        except Exception:
+            traceback.print_exc()
 
     def _upd_cat(self, cdict, tag, new_cat):
         prio = {'BS':1, 'PL':1, 'CF':1, 'SS':2, 'Notes':3, 'Others':9}
@@ -305,10 +357,15 @@ class TaxonomyManager:
             data = json.load(f)
             self.base_labels = data.get('labels', {})
             self.base_categories = data.get('categories', {})
+            self.base_aliases = data.get('aliases', {})
 
     def _save_base_json(self):
         with open(self.base_cache_file, 'w', encoding='utf-8') as f:
-            json.dump({'labels': self.base_labels, 'categories': self.base_categories}, f, ensure_ascii=False)
+            json.dump({
+                'labels': self.base_labels, 
+                'categories': self.base_categories,
+                'aliases': self.base_aliases
+            }, f, ensure_ascii=False)
 
 class XbrlExtractor:
     def __init__(self, tm):
@@ -323,7 +380,10 @@ class XbrlExtractor:
                 if rows:
                     data.extend(rows)
                     print(f"  [Hit] {rows[0]['企業名']} ({len(rows)} rows) - {os.path.basename(zp)}")
-            except: continue
+            except Exception as e:
+                # 抽出エラーはログを出すが止まらない
+                print(f"[Error] {os.path.basename(zp)}: {e}")
+                continue
         return data
 
     def _parse(self, zp, pats, years):
@@ -336,14 +396,12 @@ class XbrlExtractor:
             
             fl = soup.find(re.compile(r'.*FilerNameInJapanese'))
             cd = soup.find(re.compile(r'.*SecurityCode'))
-            
-            # ★修正: 企業名の正規化（スペース除去）
             ftxt = fl.text.strip().replace(' ', '').replace('　', '') if fl else "Unknown"
             ctxt = cd.text.strip() if cd else ""
             
             if not any(k.strip() in f"{ftxt} {ctxt}" for p in pats for k in p.split('|')): return []
             
-            lmap, cmap = self.tm.get_combined_map(ctxt)
+            lmap, amap, cmap = self.tm.get_combined_map(ctxt)
             
             ctxs = {}
             for c in soup.find_all(re.compile(r'.*context$')):
@@ -355,17 +413,26 @@ class XbrlExtractor:
                     if 'NonConsolidated' in v: is_con = False
                     if v not in ['ConsolidatedMember', 'NonConsolidatedMember']: mems.append(v)
                 
-                fy, pdate = "-", None
+                fy, p_str, p_end, p_inst = "-", None, None, None
                 p = c.find(re.compile(r'.*period$'))
                 if p:
                     i = p.find(re.compile(r'.*instant$'))
+                    s = p.find(re.compile(r'.*startDate$'))
                     e = p.find(re.compile(r'.*endDate$'))
-                    dstr = i.text if i else (e.text if e else "")
-                    if dstr:
-                        try: pdate = datetime.strptime(dstr, '%Y-%m-%d')
+                    if i: p_inst = i.text.strip()
+                    if s: p_str = s.text.strip()
+                    if e: p_end = e.text.strip()
+                    ref_date_str = p_inst if p_inst else p_end
+                    if ref_date_str:
+                        try:
+                            dt = datetime.strptime(ref_date_str, '%Y-%m-%d')
+                            fy = f"FY{dt.year - 1 if dt.month <= 3 else dt.year}"
                         except: pass
-                if pdate: fy = f"FY{pdate.year - 1 if pdate.month <= 3 else pdate.year}"
-                ctxs[cid] = {'type': "連結" if is_con else "単体", 'fy': fy, 'det': ", ".join(mems) if mems else "-"}
+                
+                ctxs[cid] = {
+                    'type': "連結" if is_con else "単体", 'fy': fy, 'det': ", ".join(mems) if mems else "-",
+                    'start': p_str, 'end': p_end, 'instant': p_inst
+                }
 
             res = []
             for t in soup.find_all():
@@ -384,19 +451,27 @@ class XbrlExtractor:
                     else: val_text = val_str
                 
                 tname = t.name
-                lbl = "-"
-                if tname in lmap: lbl = lmap[tname]
-                elif t.prefix and f"{t.prefix}_{tname}" in lmap: lbl = lmap[f"{t.prefix}_{tname}"]
+                prefix = t.prefix if t.prefix else ""
+                key = tname
+                if prefix and f"{prefix}_{tname}" in lmap: key = f"{prefix}_{tname}"
                 
-                cat = cmap.get(tname)
-                if not cat and t.prefix: cat = cmap.get(f"{t.prefix}_{tname}")
+                lbl = lmap.get(key, "-")
+                aliases = "|".join(amap.get(key, []))
+                
+                cat = cmap.get(key)
+                if not cat and prefix: cat = cmap.get(f"{prefix}_{tname}")
                 if not cat: cat = self._guess(lbl)
+                
+                decimals = t.get('decimals')
                 
                 res.append({
                     '企業名': ftxt, '証券コード': ctxt, '会計年度': info['fy'], 'カテゴリ': cat,
                     '項目名(日本語)': lbl, '値(数値)': val_num, '値(文字)': val_text,
                     '単位': t.get('unitRef'), '単体連結区分': info['type'], '詳細文脈': info['det'], 
-                    '元ファイル': fname, '項目名(英語)': f"{t.prefix}:{t.name}" if t.prefix else t.name
+                    '元ファイル': fname, '項目名(英語)': f"{prefix}:{tname}",
+                    'タグ(要素名)': tname, 'タグ(Prefix)': prefix, '全ラベル': aliases, 
+                    '期間(開始)': info['start'], '期間(終了)': info['end'], '期間(時点)': info['instant'],
+                    '精度': decimals, 'ContextID': cref
                 })
         return res
 

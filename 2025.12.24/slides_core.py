@@ -7,6 +7,7 @@ import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
@@ -424,6 +425,69 @@ def build_slide_inputs_from_layout(
     ]
 
     return data_store, cover_content, slides_structure
+
+def extract_page_columns(page_def: Dict[str, Any]) -> List[str]:
+    """Collect data column names referenced by a slide definition."""
+    mapping = page_def.get("data_mapping", {})
+    category = page_def.get("category")
+    cols: List[str] = []
+    if category == "combo_bar_line_2axis":
+        cols += [trace["col"] for trace in mapping.get("bar_traces", [])]
+        cols += [trace["col"] for trace in mapping.get("line_traces", [])]
+        cols.append(mapping.get("x_col", "period_label"))
+    elif category == "balance_sheet":
+        stack_keys = (
+            "left_stack",
+            "left_stack_for_bank",
+            "left_stack_summary",
+            "right_stack",
+            "right_stack_for_bank",
+            "right_stack_summary",
+        )
+        for stack_key in stack_keys:
+            cols += [item["col"] for item in mapping.get(stack_key, [])]
+        cols.append(mapping.get("total_assets_col", "Total Assets"))
+    elif category == "portfolio_timeseries":
+        cols += [trace["col"] for trace in mapping.get("series", [])]
+        cols.append(mapping.get("x_col", "period_label"))
+    return sorted({col for col in cols if col})
+
+
+def build_slide_deck(
+    company_name: str,
+    slides_structure: List[Dict[str, Any]],
+    data_store: Dict[str, Any],
+    selected_titles: Optional[Iterable[str]] = None,
+    text_blocks: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    date: Optional[str] = None,
+    sub_title: str = "Generated from XBRL",
+    proposal_section_title: str = "Key Findings",
+) -> SlideDeck:
+    """Build a slide deck with optional filtering and text block insertion."""
+    selected_set = {title for title in selected_titles} if selected_titles else None
+    pages: List[SlidePage] = []
+
+    for slide_def in slides_structure:
+        if selected_set is not None and slide_def.get("slide_title") not in selected_set:
+            continue
+        page_def = dict(slide_def)
+        source_key = page_def.pop("data_source", None)
+        if source_key:
+            page_def["data_frame"] = data_store.get(source_key)
+        page_def["data_columns"] = extract_page_columns(page_def)
+        text_block = text_blocks.get(page_def.get("slide_title", ""), None) if text_blocks else None
+        if text_block:
+            page_def["text_blocks"] = text_block
+            page_def["proposal_section_title"] = proposal_section_title
+        pages.append(SlidePage(**page_def))
+
+    cover = SlideCover(
+        main_title=f"{company_name} Financial Review",
+        sub_title=sub_title,
+        date=date or datetime.now().strftime("%Y-%m-%d"),
+    )
+
+    return SlideDeck(cover=cover, pages=pages)
 
 # ==============================
 # B2. Page helpers
@@ -1062,17 +1126,30 @@ class MatplotlibStrategy(ChartStrategyBase):
             if legend_max:
                 legend_items = sorted(legend_items, key=lambda x: x["value"], reverse=True)[: int(legend_max)]
             if legend_items:
+                legend_inside = bool(mapping.get("legend_inside", False))
+                legend_loc = mapping.get("legend_loc")
+                legend_bbox = mapping.get("legend_bbox_to_anchor")
+                if not legend_loc:
+                    legend_loc = "upper right" if legend_inside else "center left"
+                if legend_bbox is None:
+                    legend_bbox = (0.98, 0.98) if legend_inside else (1.02, 0.5)
                 handles = [mpatches.Patch(color=item["color"], label=item["label"]) for item in legend_items]
                 ax.legend(
                     handles=handles,
-                    loc="center left",
-                    bbox_to_anchor=(1.02, 0.5),
-                    frameon=False,
+                    loc=legend_loc,
+                    bbox_to_anchor=legend_bbox,
+                    frameon=legend_inside,
+                    framealpha=0.85 if legend_inside else 0.0,
                     fontsize=self.config.fonts.chart_tick_size,
                 )
 
         show_segment_labels = bool(mapping.get("show_segment_labels", True))
         show_summary_labels = bool(mapping.get("show_summary_labels", True))
+        group_label_position = mapping.get("group_label_position", "inside")
+        avoid_label_overlap = bool(mapping.get("avoid_label_overlap", True))
+        if avoid_label_overlap and group_label_position == "inside":
+            show_segment_labels = False
+            show_summary_labels = False
         segment_label_min_ratio = float(mapping.get("segment_label_min_ratio", 0.08))
         segment_label_font_size = int(mapping.get("segment_label_font_size", max(self.config.fonts.chart_tick_size - 1, 8)))
         segment_label_color = self._get_color(mapping.get("segment_label_color_key", "gray_dark"))
@@ -1128,25 +1205,42 @@ class MatplotlibStrategy(ChartStrategyBase):
                 cursor += total
             return spans
 
-        def _annotate_groups(x_pos: int, spans: List[Tuple[float, float, str]], offset: float) -> None:
+        def _annotate_groups(
+            x_pos: int,
+            spans: List[Tuple[float, float, str]],
+            offset: float,
+            position: str,
+            total: float,
+        ) -> None:
             if not spans:
                 return
             color = self._get_color(mapping.get("group_label_color_key", "gray_dark"))
             font_size = int(mapping.get("group_label_font_size", max(self.config.fonts.chart_tick_size - 1, 8)))
+            min_ratio = float(mapping.get("group_label_min_ratio", 0.08))
             for start, end, label in spans:
                 if not label:
                     continue
+                span_val = max(end - start, 0)
+                if total > 0 and (span_val / total) < min_ratio:
+                    continue
                 mid = (start + end) / 2
+                if position == "inside":
+                    x_text = x_pos
+                    ha = "center"
+                else:
+                    x_text = x_pos + offset
+                    ha = "right" if offset < 0 else "left"
                 ax.text(
-                    x_pos + offset,
+                    x_text,
                     mid,
                     label,
-                    ha="right" if offset < 0 else "left",
+                    ha=ha,
                     va="center",
                     fontsize=font_size,
                     color=color,
                 )
-                ax.hlines(end, x_pos - 0.28, x_pos + 0.28, color="#D0D0D0", linewidth=0.6)
+                if position != "inside":
+                    ax.hlines(end, x_pos - 0.28, x_pos + 0.28, color="#D0D0D0", linewidth=0.6)
 
         left_groups = mapping.get("left_groups", [])
         right_groups = mapping.get("right_groups", [])
@@ -1171,8 +1265,20 @@ class MatplotlibStrategy(ChartStrategyBase):
                 summary_label_position if right_stack_name == "summary" else "inside",
             )
 
-        _annotate_groups(0, _group_spans(left_stack_data, left_groups), offset=-0.3)
-        _annotate_groups(1, _group_spans(right_stack_data, right_groups), offset=0.3)
+        _annotate_groups(
+            0,
+            _group_spans(left_stack_data, left_groups),
+            offset=-0.3,
+            position=group_label_position,
+            total=sum(d["value"] for d in left_stack_data),
+        )
+        _annotate_groups(
+            1,
+            _group_spans(right_stack_data, right_groups),
+            offset=0.3,
+            position=group_label_position,
+            total=sum(d["value"] for d in right_stack_data),
+        )
 
         fig, ax = self._apply_common_style(fig, ax, chart_text)
         ax.xaxis.grid(False)
@@ -1181,16 +1287,663 @@ class MatplotlibStrategy(ChartStrategyBase):
 
 
 class PlotlyStrategy(ChartStrategyBase):
-    """Placeholder for Plotly rendering strategy."""
+    """Plotly-based rendering strategy (optional)."""
+
+    def __init__(self, config: SlideConfig) -> None:
+        super().__init__(config)
+        vendor_candidates = [
+            Path(os.getcwd()) / "vendor_kaleido_010",
+            Path(os.getcwd()) / "vendor_kaleido",
+        ]
+        for vendor_dir in vendor_candidates:
+            if not vendor_dir.exists():
+                continue
+            import sys
+            vendor_path = str(vendor_dir)
+            if vendor_path not in sys.path:
+                sys.path.insert(0, vendor_path)
+            break
+        try:
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+        except ImportError as exc:
+            raise ImportError("Plotly is required when engine='plotly'.") from exc
+        self.go = go
+        self.make_subplots = make_subplots
+
+    def _apply_common_layout(self, fig: Any, chart_text: Dict[str, Any]) -> None:
+        fig.update_layout(
+            title=dict(
+                text=chart_text.get("title", ""),
+                font=dict(size=self.config.fonts.chart_title_size, color=self._get_color("navy")),
+                x=0.5,
+            ),
+            font=dict(family=self.config.fonts.japanese_font, size=self.config.fonts.chart_tick_size, color=self._get_color("gray_dark")),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            margin=dict(l=60, r=40, t=80, b=80),
+        )
+
+    def _format_x_labels(self, series: pd.Series, mapping: Dict[str, Any]) -> List[Any]:
+        if mapping.get("x_label_format") == "fy":
+            return series.map(_format_period_label_fy).tolist()
+        return series.tolist()
+
+    def _set_yaxis_ticks(self, fig: Any, values: List[float], unit_scale: float, secondary: bool = False) -> None:
+        numeric = pd.Series(values).dropna()
+        if numeric.empty:
+            return
+        min_val = float(numeric.min())
+        max_val = float(numeric.max())
+        if min_val == max_val:
+            tick_vals = [min_val]
+        else:
+            steps = 4
+            span = max_val - min_val
+            tick_vals = [min_val + (span * i / steps) for i in range(steps + 1)]
+        formatter = scaled_number_formatter if unit_scale != 1.0 else jpy_currency_formatter
+        tick_text = [formatter(val, None) for val in tick_vals]
+        if secondary:
+            try:
+                fig.update_yaxes(tickmode="array", tickvals=tick_vals, ticktext=tick_text, secondary_y=True)
+            except Exception:
+                fig.update_yaxes(tickmode="array", tickvals=tick_vals, ticktext=tick_text)
+            return
+        fig.update_yaxes(tickmode="array", tickvals=tick_vals, ticktext=tick_text)
 
     def plot_combo_bar_line_2axis(self, df: Any, mapping: Dict[str, Any], chart_text: Dict[str, Any]) -> Any:
-        raise NotImplementedError("Plotly strategy is not implemented.")
+        fig = self.make_subplots(specs=[[{"secondary_y": True}]])
+        if df is None or len(df) == 0:
+            self._apply_common_layout(fig, chart_text)
+            return fig
+
+        x_col = mapping["x_col"]
+        df_plot = df.copy()
+        x_labels = self._format_x_labels(df_plot[x_col], mapping)
+        unit_scale = float(mapping.get("unit_scale", 1.0) or 1.0)
+
+        bar_traces = mapping.get("bar_traces", [])
+        line_traces = mapping.get("line_traces", [])
+
+        bar_values: List[float] = []
+        for trace in bar_traces:
+            col = trace["col"]
+            values = pd.to_numeric(df_plot.get(col, pd.Series([None] * len(df_plot))), errors="coerce")
+            if unit_scale != 1.0:
+                values = values / unit_scale
+            bar_values += values.fillna(0).tolist()
+            fig.add_trace(
+                self.go.Bar(
+                    x=x_labels,
+                    y=values,
+                    name=trace.get("name", col),
+                    marker_color=self._get_color(trace.get("color_key", "navy")),
+                    opacity=0.85,
+                ),
+                secondary_y=False,
+            )
+
+        line_values: List[float] = []
+        for trace in line_traces:
+            col = trace["col"]
+            values = pd.to_numeric(df_plot.get(col, pd.Series([None] * len(df_plot))), errors="coerce")
+            if unit_scale != 1.0:
+                values = values / unit_scale
+            line_values += values.fillna(0).tolist()
+            fig.add_trace(
+                self.go.Scatter(
+                    x=x_labels,
+                    y=values,
+                    name=trace.get("name", col),
+                    mode="lines+markers",
+                    line=dict(color=self._get_color(trace.get("color_key", "red")), width=trace.get("line_width", 3.5)),
+                    marker=dict(size=trace.get("marker_size", 10)),
+                ),
+                secondary_y=True,
+            )
+
+        fig.update_layout(barmode="group")
+        fig.update_yaxes(title_text=chart_text.get("y1_label", ""), secondary_y=False)
+        fig.update_yaxes(title_text=chart_text.get("y2_label", ""), secondary_y=True)
+        self._set_yaxis_ticks(fig, bar_values, unit_scale, secondary=False)
+        if line_traces:
+            self._set_yaxis_ticks(fig, line_values, unit_scale, secondary=True)
+
+        x_label_rotation = float(mapping.get("x_label_rotation", 0))
+        tick_step = mapping.get("x_tick_step")
+        if tick_step is None:
+            tick_step = 2 if len(x_labels) > 12 else 1
+        if tick_step and int(tick_step) > 1:
+            tick_vals = [x_labels[idx] for idx in range(len(x_labels)) if idx % int(tick_step) == 0]
+            fig.update_xaxes(tickmode="array", tickvals=tick_vals, ticktext=tick_vals)
+        fig.update_xaxes(tickangle=x_label_rotation)
+
+        self._apply_common_layout(fig, chart_text)
+        return fig
 
     def plot_balance_sheet(self, df: Any, mapping: Dict[str, Any], chart_text: Dict[str, Any]) -> Any:
-        raise NotImplementedError("Plotly strategy is not implemented.")
+        if df is None or len(df) == 0:
+            raise ValueError("DataFrame is empty.")
+        row = df.iloc[0]
+
+        unit_scale = mapping.get("unit_scale", 1.0)
+        total_assets_col = mapping.get("total_assets_col")
+        total_assets_val = row.get(total_assets_col, 0)
+        if pd.isna(total_assets_val):
+            total_assets_val = 0
+        total_assets_val = float(total_assets_val)
+        auto_balance_assets = mapping.get("auto_balance_assets", False)
+        auto_balance_liab_equity = mapping.get("auto_balance_liab_equity", False)
+        other_assets_label = mapping.get("other_assets_label", "Other Assets")
+        other_liab_equity_label = mapping.get("other_liab_equity_label", "Other Liab/Equity")
+
+        def _build_stack_data(stack_def: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            data = []
+            for item in stack_def:
+                val = row.get(item["col"], 0)
+                val = pd.to_numeric(val, errors="coerce")
+                if pd.isna(val):
+                    val = 0
+                data.append(
+                    {
+                        "label": item["name"],
+                        "value": val / unit_scale,
+                        "color": self._get_color(item.get("color_key", "gray_medium")),
+                    }
+                )
+            return data
+
+        def _select_stack_data(
+            candidates: List[Tuple[str, List[Dict[str, Any]]]],
+            total_target: float,
+            preference: Optional[str],
+            prefer_detail: bool,
+        ) -> Tuple[str, List[Dict[str, Any]]]:
+            balance_tolerance = float(mapping.get("balance_tolerance", 0.01))
+            scored: List[Tuple[float, int, str, List[Dict[str, Any]]]] = []
+
+            if preference in {"primary", "bank", "summary"}:
+                preferred_stack = next((stack for name, stack in candidates if name == preference and stack), [])
+                if preferred_stack:
+                    preferred_data = _build_stack_data(preferred_stack)
+                    preferred_total = sum(d["value"] for d in preferred_data)
+                    if preferred_total > 0:
+                        if total_target > 0:
+                            gap_ratio = abs(total_target - preferred_total) / total_target
+                            if gap_ratio <= balance_tolerance:
+                                return preference, preferred_data
+                        else:
+                            return preference, preferred_data
+
+            for name, stack_def in candidates:
+                data = _build_stack_data(stack_def)
+                total = sum(d["value"] for d in data)
+                if total <= 0:
+                    continue
+                if total_target > 0:
+                    gap_ratio = abs(total_target - total) / total_target
+                else:
+                    gap_ratio = 0
+                nonzero_count = sum(1 for d in data if d["value"] > 0)
+                scored.append((gap_ratio, nonzero_count, name, data))
+
+            if not scored:
+                return candidates[0][0], _build_stack_data(candidates[0][1])
+
+            if prefer_detail:
+                scored.sort(key=lambda x: (-x[1], x[0]))
+                best = scored[0]
+                if total_target > 0 and best[0] > balance_tolerance:
+                    scored.sort(key=lambda x: (x[0], -x[1]))
+                    return scored[0][2], scored[0][3]
+                return best[2], best[3]
+
+            within = [item for item in scored if item[0] <= balance_tolerance]
+            if within:
+                within.sort(key=lambda x: (-x[1], x[0]))
+                return within[0][2], within[0][3]
+
+            scored.sort(key=lambda x: (x[0], -x[1]))
+            return scored[0][2], scored[0][3]
+
+        def _apply_exclusive_groups(stack_def: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            exclusive_groups = mapping.get("exclusive_groups", [])
+            if not exclusive_groups:
+                return stack_def
+            drop_labels = set()
+            for group in exclusive_groups:
+                aggregate = group.get("aggregate")
+                components = group.get("components", [])
+                if not aggregate or not components:
+                    continue
+                has_component = False
+                for name in components:
+                    val = pd.to_numeric(row.get(name, 0), errors="coerce")
+                    if pd.notna(val) and float(val) != 0:
+                        has_component = True
+                        break
+                if has_component:
+                    drop_labels.add(aggregate)
+            if not drop_labels:
+                return stack_def
+            return [item for item in stack_def if item.get("name") not in drop_labels]
+
+        def _collapse_equity_components(data_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            if not mapping.get("collapse_equity_on_negative", True):
+                return data_list
+            equity_group = next(
+                (group for group in mapping.get("exclusive_groups", []) if group.get("aggregate") == "Total Equity"),
+                None,
+            )
+            if not equity_group:
+                return data_list
+            components = set(equity_group.get("components", []))
+            if not components:
+                return data_list
+            equity_items = [d for d in data_list if d["label"] in components]
+            if not equity_items:
+                return data_list
+            if not any(d["value"] < 0 for d in equity_items):
+                return data_list
+            total_equity_val = pd.to_numeric(row.get("Total Equity"), errors="coerce")
+            if pd.isna(total_equity_val):
+                return data_list
+            filtered = [d for d in data_list if d["label"] not in components and d["label"] != "Total Equity"]
+            filtered.append(
+                {
+                    "label": "Total Equity",
+                    "value": float(total_equity_val) / unit_scale,
+                    "color": self._get_color(mapping.get("equity_total_color_key", "sky_blue")),
+                }
+            )
+            return filtered
+
+        left_stack_def = _apply_exclusive_groups(mapping.get("left_stack", []))
+        if auto_balance_assets and total_assets_col:
+            filtered = [item for item in left_stack_def if item.get("col") != total_assets_col]
+            if filtered:
+                left_stack_def = filtered
+
+        detail_requested = bool(mapping.get("detail_bars", False))
+        is_bank = bool(mapping.get("is_bank", False))
+        default_pref = "bank" if is_bank else "summary"
+        if detail_requested:
+            default_pref = "bank" if is_bank else "primary"
+
+        stack_pref = mapping.get("stack_preference")
+        left_pref = mapping.get("left_stack_preference") or stack_pref or default_pref
+        right_pref = mapping.get("right_stack_preference") or stack_pref or default_pref
+        if not is_bank and left_pref == "bank":
+            left_pref = "primary" if detail_requested else "summary"
+        if not is_bank and right_pref == "bank":
+            right_pref = "primary" if detail_requested else "summary"
+
+        left_candidates = [
+            ("primary", left_stack_def),
+            ("bank", (mapping.get("left_stack_for_bank") or []) if is_bank or left_pref == "bank" else []),
+            ("summary", mapping.get("left_stack_summary") or []),
+        ]
+        right_candidates = [
+            ("primary", _apply_exclusive_groups(mapping.get("right_stack") or [])),
+            ("bank", (mapping.get("right_stack_for_bank") or []) if is_bank or right_pref == "bank" else []),
+            ("summary", mapping.get("right_stack_summary") or []),
+        ]
+
+        selection_target = (total_assets_val / unit_scale) if total_assets_val else 0
+        prefer_detail_left = bool(mapping.get("prefer_detail_left", auto_balance_assets))
+        prefer_detail_right = bool(mapping.get("prefer_detail_right", auto_balance_liab_equity))
+        if not detail_requested:
+            prefer_detail_left = False
+            prefer_detail_right = False
+
+        left_stack_name, left_stack_data = _select_stack_data(
+            left_candidates,
+            selection_target,
+            left_pref,
+            prefer_detail_left or selection_target <= 0,
+        )
+        right_stack_name, right_stack_data = _select_stack_data(
+            right_candidates,
+            selection_target,
+            right_pref,
+            prefer_detail_right or selection_target <= 0,
+        )
+
+        right_stack_data = _collapse_equity_components(right_stack_data)
+
+        left_total = sum(d["value"] for d in left_stack_data)
+        right_total = sum(d["value"] for d in right_stack_data)
+
+        balance_target = (total_assets_val / unit_scale) if total_assets_val > 0 else max(left_total, right_total)
+
+        if balance_target > 0 and auto_balance_assets and left_total < balance_target:
+            left_stack_data.append(
+                {
+                    "label": other_assets_label,
+                    "value": balance_target - left_total,
+                    "color": self._get_color(mapping.get("other_assets_color_key", "ice_blue")),
+                }
+            )
+
+        if balance_target > 0 and auto_balance_liab_equity and right_total < balance_target:
+            right_stack_data.append(
+                {
+                    "label": other_liab_equity_label,
+                    "value": balance_target - right_total,
+                    "color": self._get_color(mapping.get("other_liab_equity_color_key", "gray_light")),
+                }
+            )
+
+        fig = self.go.Figure()
+        seen_labels: set[str] = set()
+        legend_labels: set[str] = set()
+
+        show_legend = bool(mapping.get("show_legend", False))
+        legend_items: List[Dict[str, Any]] = []
+        if show_legend:
+            legend_source = mapping.get("legend_source", "selected")
+            if legend_source == "detail":
+                detail_left = _apply_exclusive_groups(mapping.get("left_stack_for_bank") if is_bank else mapping.get("left_stack", []))
+                detail_right = _apply_exclusive_groups(mapping.get("right_stack_for_bank") if is_bank else mapping.get("right_stack", []))
+                source_data = _build_stack_data(detail_left) + _build_stack_data(detail_right)
+            else:
+                source_data = left_stack_data + right_stack_data
+            for entry in source_data:
+                if entry["value"] <= 0:
+                    continue
+                label = entry["label"]
+                if label in seen_labels:
+                    continue
+                seen_labels.add(label)
+                legend_items.append({"label": label, "color": entry["color"], "value": entry["value"]})
+            legend_max = mapping.get("legend_max_items")
+            if legend_max:
+                legend_items = sorted(legend_items, key=lambda x: x["value"], reverse=True)[: int(legend_max)]
+            legend_labels = {item["label"] for item in legend_items}
+
+        def _add_stack_traces_guarded(x_pos: int, data_list: List[Dict[str, Any]]) -> None:
+            for entry in data_list:
+                if entry["value"] <= 0:
+                    continue
+                showlegend = False
+                if show_legend and entry["label"] in legend_labels:
+                    showlegend = entry["label"] not in seen_labels
+                    seen_labels.add(entry["label"])
+                fig.add_trace(
+                    self.go.Bar(
+                        x=[x_pos],
+                        y=[entry["value"]],
+                        name=entry["label"],
+                        marker_color=entry["color"],
+                        showlegend=showlegend,
+                    )
+                )
+
+        seen_labels = set()
+        _add_stack_traces_guarded(0, left_stack_data)
+        _add_stack_traces_guarded(1, right_stack_data)
+
+        fig.update_layout(barmode="stack", showlegend=show_legend)
+        fig.update_xaxes(
+            tickmode="array",
+            tickvals=[0, 1],
+            ticktext=[mapping.get("left_label", "Assets"), mapping.get("right_label", "Liabilities & Equity")],
+        )
+        fig.update_yaxes(title_text=chart_text.get("y1_label", ""))
+        y_values = [d["value"] for d in left_stack_data + right_stack_data]
+        self._set_yaxis_ticks(fig, y_values, unit_scale, secondary=False)
+
+        if show_legend:
+            legend_inside = bool(mapping.get("legend_inside", False))
+            if legend_inside:
+                legend_config = dict(x=0.98, y=0.98, xanchor="right", yanchor="top", bgcolor="rgba(255,255,255,0.85)")
+            else:
+                legend_config = dict(x=1.02, y=0.5, xanchor="left", yanchor="middle", bgcolor="rgba(0,0,0,0)")
+            fig.update_layout(legend=legend_config)
+
+        show_segment_labels = bool(mapping.get("show_segment_labels", True))
+        show_summary_labels = bool(mapping.get("show_summary_labels", True))
+        group_label_position = mapping.get("group_label_position", "inside")
+        avoid_label_overlap = bool(mapping.get("avoid_label_overlap", True))
+        if avoid_label_overlap and group_label_position == "inside":
+            show_segment_labels = False
+            show_summary_labels = False
+        segment_label_min_ratio = float(mapping.get("segment_label_min_ratio", 0.08))
+        segment_label_font_size = int(mapping.get("segment_label_font_size", max(self.config.fonts.chart_tick_size - 1, 8)))
+        segment_label_color = self._get_color(mapping.get("segment_label_color_key", "gray_dark"))
+        summary_label_max_length = int(mapping.get("summary_label_max_length", 30))
+
+        def _annotate_segments(
+            x_pos: int,
+            data_list: List[Dict[str, Any]],
+            max_length: int = 18,
+            position: str = "inside",
+        ) -> None:
+            total = sum(d["value"] for d in data_list)
+            if total <= 0:
+                return
+            bottom = 0
+            for d in data_list:
+                val = d["value"]
+                if val <= 0:
+                    continue
+                ratio = val / total if total else 0
+                label = d["label"]
+                if ratio >= segment_label_min_ratio and len(label) <= max_length:
+                    if position == "outside":
+                        x_text = x_pos - 0.38 if x_pos == 0 else x_pos + 0.38
+                        align = "right" if x_pos == 0 else "left"
+                    else:
+                        x_text = x_pos
+                        align = "center"
+                    fig.add_annotation(
+                        x=x_text,
+                        y=bottom + (val / 2),
+                        text=label,
+                        showarrow=False,
+                        xanchor=align,
+                        font=dict(size=segment_label_font_size, color=segment_label_color),
+                    )
+                bottom += val
+
+        def _group_spans(data_list: List[Dict[str, Any]], groups: List[Dict[str, Any]]) -> List[Tuple[float, float, str]]:
+            if not groups:
+                return []
+            value_map = {entry["label"]: entry["value"] for entry in data_list}
+            spans = []
+            cursor = 0.0
+            for group in groups:
+                items = group.get("items", [])
+                label = group.get("label", "")
+                total = sum(value_map.get(item, 0) for item in items)
+                if total <= 0:
+                    continue
+                spans.append((cursor, cursor + total, label))
+                cursor += total
+            return spans
+
+        def _annotate_groups(
+            x_pos: int,
+            spans: List[Tuple[float, float, str]],
+            offset: float,
+            position: str,
+            total: float,
+        ) -> None:
+            if not spans:
+                return
+            color = self._get_color(mapping.get("group_label_color_key", "gray_dark"))
+            font_size = int(mapping.get("group_label_font_size", max(self.config.fonts.chart_tick_size - 1, 8)))
+            min_ratio = float(mapping.get("group_label_min_ratio", 0.08))
+            for start, end, label in spans:
+                if not label:
+                    continue
+                span_val = max(end - start, 0)
+                if total > 0 and (span_val / total) < min_ratio:
+                    continue
+                mid = (start + end) / 2
+                if position == "inside":
+                    x_text = x_pos
+                    align = "center"
+                else:
+                    x_text = x_pos + offset
+                    align = "right" if offset < 0 else "left"
+                fig.add_annotation(
+                    x=x_text,
+                    y=mid,
+                    text=label,
+                    showarrow=False,
+                    xanchor=align,
+                    font=dict(size=font_size, color=color),
+                )
+                if position != "inside":
+                    fig.add_shape(
+                        type="line",
+                        x0=x_pos - 0.28,
+                        x1=x_pos + 0.28,
+                        y0=end,
+                        y1=end,
+                        line=dict(color="#D0D0D0", width=1),
+                    )
+
+        left_groups = mapping.get("left_groups", [])
+        right_groups = mapping.get("right_groups", [])
+        if left_stack_name == "bank":
+            left_groups = mapping.get("left_groups_for_bank", left_groups)
+        if right_stack_name == "bank":
+            right_groups = mapping.get("right_groups_for_bank", right_groups)
+
+        summary_label_position = mapping.get("summary_label_position", "inside")
+        if show_segment_labels or (show_summary_labels and left_stack_name == "summary"):
+            _annotate_segments(
+                0,
+                left_stack_data,
+                summary_label_max_length if left_stack_name == "summary" else 18,
+                summary_label_position if left_stack_name == "summary" else "inside",
+            )
+        if show_segment_labels or (show_summary_labels and right_stack_name == "summary"):
+            _annotate_segments(
+                1,
+                right_stack_data,
+                summary_label_max_length if right_stack_name == "summary" else 18,
+                summary_label_position if right_stack_name == "summary" else "inside",
+            )
+
+        _annotate_groups(
+            0,
+            _group_spans(left_stack_data, left_groups),
+            offset=-0.3,
+            position=group_label_position,
+            total=sum(d["value"] for d in left_stack_data),
+        )
+        _annotate_groups(
+            1,
+            _group_spans(right_stack_data, right_groups),
+            offset=0.3,
+            position=group_label_position,
+            total=sum(d["value"] for d in right_stack_data),
+        )
+
+        self._apply_common_layout(fig, chart_text)
+        fig.update_layout(width=800, height=800)
+        return fig
 
     def plot_portfolio_timeseries(self, df: Any, mapping: Dict[str, Any], chart_text: Dict[str, Any]) -> Any:
-        raise NotImplementedError("Plotly strategy is not implemented.")
+        if df is None or len(df) == 0:
+            raise ValueError("DataFrame is empty.")
+
+        fig = self.go.Figure()
+        df_plot = df.copy()
+        x_col = mapping.get("x_col", "period_label")
+        x_labels = self._format_x_labels(df_plot[x_col], mapping)
+
+        unit_scale = float(mapping.get("unit_scale", 1.0) or 1.0)
+        series_defs = mapping.get("series", [])
+        if not series_defs:
+            raise ValueError("Portfolio series definitions are empty.")
+
+        for spec in series_defs:
+            col = spec.get("col")
+            if col in df_plot.columns and unit_scale != 1.0:
+                df_plot[col] = pd.to_numeric(df_plot[col], errors="coerce") / unit_scale
+
+        area_defs = [spec for spec in series_defs if spec.get("chart_type", "area") != "line"]
+        line_defs = [spec for spec in series_defs if spec.get("chart_type", "area") == "line"]
+
+        chart_style = mapping.get("chart_style", "area")
+        x_vals = x_labels
+        if chart_style == "stacked_bar":
+            x_vals = list(range(len(x_labels)))
+            for spec in area_defs:
+                col = spec.get("col")
+                if not col or col not in df_plot.columns:
+                    values = [0] * len(df_plot)
+                else:
+                    values = pd.to_numeric(df_plot[col], errors="coerce").fillna(0).tolist()
+                fig.add_trace(
+                    self.go.Bar(
+                        x=x_vals,
+                        y=values,
+                        name=spec.get("name", col),
+                        marker_color=self._get_color(spec.get("color_key", "navy")),
+                        opacity=0.85,
+                    )
+                )
+            fig.update_layout(barmode="stack")
+            fig.update_xaxes(tickmode="array", tickvals=x_vals, ticktext=x_labels)
+        else:
+            for spec in area_defs:
+                col = spec.get("col")
+                if not col or col not in df_plot.columns:
+                    values = [0] * len(df_plot)
+                else:
+                    values = pd.to_numeric(df_plot[col], errors="coerce").fillna(0).tolist()
+                fig.add_trace(
+                    self.go.Scatter(
+                        x=x_vals,
+                        y=values,
+                        name=spec.get("name", col),
+                        stackgroup="one",
+                        mode="lines",
+                        line=dict(width=0.5, color=self._get_color(spec.get("color_key", "navy"))),
+                        fill="tonexty",
+                    )
+                )
+
+        for spec in line_defs:
+            col = spec.get("col")
+            if not col or col not in df_plot.columns:
+                continue
+            values = pd.to_numeric(df_plot[col], errors="coerce")
+            fig.add_trace(
+                self.go.Scatter(
+                    x=x_vals,
+                    y=values,
+                    name=spec.get("name", col),
+                    mode="lines+markers",
+                    line=dict(color=self._get_color(spec.get("color_key", "red")), width=spec.get("line_width", 3.0)),
+                    marker=dict(size=spec.get("marker_size", 9)),
+                )
+            )
+
+        y_values = []
+        for spec in series_defs:
+            col = spec.get("col")
+            if col in df_plot.columns:
+                y_values += pd.to_numeric(df_plot[col], errors="coerce").fillna(0).tolist()
+        self._set_yaxis_ticks(fig, y_values, unit_scale, secondary=False)
+        fig.update_yaxes(title_text=chart_text.get("y1_label", ""))
+
+        x_label_rotation = float(mapping.get("x_label_rotation", 0))
+        tick_step = mapping.get("x_tick_step")
+        if tick_step is None:
+            tick_step = 2 if len(x_labels) > 12 else 1
+        if tick_step and int(tick_step) > 1:
+            tick_vals = [x_labels[idx] for idx in range(len(x_labels)) if idx % int(tick_step) == 0]
+            fig.update_xaxes(tickmode="array", tickvals=tick_vals, ticktext=tick_vals)
+        fig.update_xaxes(tickangle=x_label_rotation)
+
+        self._apply_common_layout(fig, chart_text)
+        return fig
 
 # ==============================
 # D. Slide generation engine
@@ -1289,6 +2042,14 @@ class PowerPointGeneratorEngine:
         final_left = box_left + (box_width - new_w) / 2
         final_top = box_top + (box_height - new_h) / 2
         slide.Shapes.AddPicture(image_path, MSO_FALSE, MSO_TRUE, final_left, final_top, new_w, new_h)
+
+    def _save_chart_image(self, fig: Any, img_path: str) -> None:
+        if hasattr(fig, "write_image"):
+            width = getattr(fig.layout, "width", None) or 1800
+            height = getattr(fig.layout, "height", None) or 1050
+            fig.write_image(img_path, width=width, height=height, scale=1)
+            return
+        fig.savefig(img_path, dpi=150, bbox_inches="tight")
 
     def _calculate_auto_font_size(self, text: str, max_size: int) -> int:
         length = len(text)
@@ -1502,8 +2263,9 @@ class PowerPointGeneratorEngine:
                     img_filename = f"chart_{uuid.uuid4()}.png"
                     img_path = os.path.join(self.config.paths.temp_img_dir, img_filename)
 
-                    fig.savefig(img_path, dpi=150, bbox_inches="tight")
-                    plt.close(fig)
+                    self._save_chart_image(fig, img_path)
+                    if hasattr(fig, "savefig"):
+                        plt.close(fig)
 
                     self._add_picture_fitted(new_slide, img_path, chart_area_ratio)
 
@@ -1562,4 +2324,3 @@ class PowerPointGeneratorEngine:
                     shutil.rmtree(self.config.paths.temp_img_dir)
                 except Exception:
                     pass
-

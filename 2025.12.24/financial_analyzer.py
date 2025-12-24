@@ -83,6 +83,7 @@ class FinancialAnalyzer:
         self.prefer_consolidated = prefer_consolidated
         self.standard = standard or self._infer_standard(self.facts)
         self.company_name = company_name
+        self._filter_cache: Dict[Tuple[Optional[str], bool, int, bool], pd.DataFrame] = {}
 
         mapping_dict = mapping or ColumnDefinitionConfig.resolve_mapping(
             standard=self.standard,
@@ -419,19 +420,16 @@ class FinancialAnalyzer:
         if df.empty:
             return df
 
-        scores = []
-        for _, row in df.iterrows():
-            if rule.canonical_key == "TotalEquity":
-                element_value = str(row.get("Element", "") or "")
-                label_value = str(row.get("Label", "") or "")
-                if ("LiabilitiesAndNetAssets" in element_value) or ("LiabilitiesAndNetAssets" in label_value):
-                    scores.append(0.0)
-                    continue
-            score = 0.0
-            for cand in rule.candidates:
-                if self._candidate_match(row, cand):
-                    score += cand.weight
-            scores.append(score)
+        scores = self._score_candidates(df, rule.candidates)
+        if rule.canonical_key == "TotalEquity":
+            element_values = df.get("Element", "").astype(str)
+            label_values = df.get("Label", "").astype(str)
+            exclude_mask = element_values.str.contains("LiabilitiesAndNetAssets", regex=False) | label_values.str.contains(
+                "LiabilitiesAndNetAssets", regex=False
+            )
+            if exclude_mask.any():
+                scores = scores.copy()
+                scores.loc[exclude_mask] = 0.0
 
         df = df.copy()
         df["match_score"] = scores
@@ -488,13 +486,7 @@ class FinancialAnalyzer:
         if df.empty:
             return df
 
-        scores = []
-        for _, row in df.iterrows():
-            score = 0.0
-            for cand in rule.candidates:
-                if self._candidate_match(row, cand):
-                    score += cand.weight
-            scores.append(score)
+        scores = self._score_candidates(df, rule.candidates)
 
         df = df.copy()
         df["match_score"] = scores
@@ -545,6 +537,16 @@ class FinancialAnalyzer:
         include_dimensioned: bool = False,
     ) -> pd.DataFrame:
         """Apply period type and annual duration filters."""
+        cache_key = (
+            period_type,
+            bool(period_filter.prefer_duration),
+            int(period_filter.min_duration_days),
+            bool(include_dimensioned),
+        )
+        cached = self._filter_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         df = self.facts
 
         if not include_dimensioned and "dimension_allowed" in df.columns:
@@ -563,6 +565,7 @@ class FinancialAnalyzer:
             duration_mask = df["period_type"] == "duration"
             df = df[~duration_mask | df["duration_days"].isna() | (df["duration_days"] >= period_filter.min_duration_days)]
 
+        self._filter_cache[cache_key] = df
         return df
 
     def _candidate_match(self, row: pd.Series, cand: MappingCandidate) -> bool:
@@ -582,6 +585,43 @@ class FinancialAnalyzer:
         if cand.regex:
             return re.search(cand.regex, value, flags=re.IGNORECASE) is not None
         return False
+
+    @staticmethod
+    def _score_candidates(df: pd.DataFrame, candidates: Sequence[MappingCandidate]) -> pd.Series:
+        """Vectorized scoring for candidate matching."""
+        if df.empty or not candidates:
+            return pd.Series(0.0, index=df.index, dtype="float64")
+
+        field_map = {
+            "element": "Element",
+            "tag": "Tag",
+            "label": "Label",
+        }
+        field_cache: Dict[str, pd.Series] = {}
+        field_lower_cache: Dict[str, pd.Series] = {}
+        scores = pd.Series(0.0, index=df.index, dtype="float64")
+
+        for cand in candidates:
+            field_name = field_map.get(cand.field)
+            if not field_name or field_name not in df.columns:
+                continue
+            if field_name not in field_cache:
+                field_cache[field_name] = df[field_name].astype(str)
+
+            match = None
+            if cand.exact:
+                if field_name not in field_lower_cache:
+                    field_lower_cache[field_name] = field_cache[field_name].str.lower()
+                exact_value = str(cand.exact).lower()
+                match = field_lower_cache[field_name] == exact_value
+            if cand.regex:
+                regex_match = field_cache[field_name].str.contains(cand.regex, case=False, regex=True)
+                match = regex_match if match is None else (match | regex_match)
+            if match is None:
+                continue
+            scores += cand.weight * match.astype(float)
+
+        return scores
 
     def _portfolio_rules(self) -> List[PortfolioRule]:
         """Return portfolio extraction rules with regex-based candidates."""
@@ -738,7 +778,8 @@ class FinancialAnalyzer:
         if "dimensions" in df.columns:
             dim_series = df["dimensions"].astype(str).str.strip()
             dim_mask = dim_series.isna() | dim_series.eq("") | dim_series.eq("{}") | dim_series.eq("nan") | dim_series.eq("None")
-            allowed_mask = dim_series.apply(self._is_allowed_dimension)
+            allowed_map = {value: self._is_allowed_dimension(value) for value in dim_series.unique()}
+            allowed_mask = dim_series.map(allowed_map)
             df["dimension_allowed"] = dim_mask | allowed_mask
         else:
             df["dimension_allowed"] = True
